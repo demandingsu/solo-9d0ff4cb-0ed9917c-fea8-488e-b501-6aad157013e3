@@ -13,12 +13,14 @@
 import csv
 import hashlib
 import io
+import sqlite3
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 MAX_DESTINATIONS = 4
 MAX_NAME_LEN = 64
+MIN_GROUP_DESTINATIONS = 2
 
 KIND_DELIVERY = "交货"
 KIND_REMAINING = "余箱"
@@ -31,6 +33,14 @@ DELIVERY_HEADERS = ["仓次", "类型", "去向", "箱数"]
 
 class BatchRejected(Exception):
     """整批校验未通过：problems 为面向用户的问题列表，本次上传全部退回。"""
+
+    def __init__(self, problems):
+        super().__init__("; ".join(problems))
+        self.problems = list(problems)
+
+
+class GroupRejected(Exception):
+    """建组 / 撤组被退回：problems 为面向用户的问题列表，本次改动不生效。"""
 
     def __init__(self, problems):
         super().__init__("; ".join(problems))
@@ -214,8 +224,11 @@ def check_balance(batch, problems):
             )
 
 
-def validate_batch(batch, existing_sessions, existing_destinations):
-    """整批校验，返回 {session: orchard}；未通过抛 BatchRejected。"""
+def validate_batch(batch, existing_sessions, existing_destinations, group_names_by_orchard=None):
+    """整批校验，返回 {session: orchard}；未通过抛 BatchRejected。
+
+    group_names_by_orchard 为 {orchard: {组名,...}}，用于拦截与组名重名的去向。
+    """
     problems = []
 
     batch_sessions = (
@@ -238,6 +251,24 @@ def validate_batch(batch, existing_sessions, existing_destinations):
             f"{', '.join(sorted(destinations))}"
         )
 
+    if group_names_by_orchard:
+        clashes = []
+        seen = set()
+        for d in batch.deliveries:
+            orchard = session_orchard.get(d["session"])
+            if orchard is None:
+                continue
+            key = (orchard, d["destination"])
+            if key in seen:
+                continue
+            seen.add(key)
+            if d["destination"] in group_names_by_orchard.get(orchard, set()):
+                clashes.append(f"去向 “{d['destination']}”（果园 {orchard}）与已有组名重名")
+        if clashes:
+            problems.append(
+                "以下名称与同果园的组名冲突，整批退回：" + "；".join(sorted(clashes))
+            )
+
     if problems:
         raise BatchRejected(problems)
     return session_orchard
@@ -254,35 +285,36 @@ def batch_hash(inbound_bytes, transfer_bytes, delivery_bytes):
 
 
 def persist_batch(conn, digest, batch, session_orchard):
-    """单事务入账；批次哈希冲突（重复上传）抛 BatchRejected。"""
+    """在调用方已开启的写事务内入账；批次哈希冲突（重复上传）抛 BatchRejected。"""
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     try:
-        with conn:
-            cur = conn.execute(
-                "INSERT INTO uploads (batch_hash, uploaded_at, inbound_count, transfer_count, delivery_count)"
-                " VALUES (?, ?, ?, ?, ?)",
-                (digest, now, len(batch.inbound), len(batch.transfers), len(batch.deliveries)),
-            )
-            upload_id = cur.lastrowid
-            conn.executemany(
-                "INSERT INTO inbound (upload_id, session, orchard, crates) VALUES (?, ?, ?, ?)",
-                [(upload_id, r["session"], r["orchard"], r["crates"]) for r in batch.inbound],
-            )
-            conn.executemany(
-                "INSERT INTO transfers (upload_id, from_session, to_session, crates) VALUES (?, ?, ?, ?)",
-                [(upload_id, t["from_session"], t["to_session"], t["crates"]) for t in batch.transfers],
-            )
-            conn.executemany(
-                "INSERT INTO deliveries (upload_id, session, kind, destination, crates) VALUES (?, ?, ?, ?, ?)",
-                [(upload_id, d["session"], d["kind"], d["destination"], d["crates"]) for d in batch.deliveries],
-            )
-            conn.executemany(
-                "INSERT INTO sessions (name, orchard) VALUES (?, ?)",
-                [(s, o) for s, o in sorted(session_orchard.items()) if o is not None],
-            )
-    except Exception as exc:
+        cur = conn.execute(
+            "INSERT INTO uploads (batch_hash, uploaded_at, inbound_count, transfer_count, delivery_count)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (digest, now, len(batch.inbound), len(batch.transfers), len(batch.deliveries)),
+        )
+        upload_id = cur.lastrowid
+        conn.executemany(
+            "INSERT INTO inbound (upload_id, session, orchard, crates) VALUES (?, ?, ?, ?)",
+            [(upload_id, r["session"], r["orchard"], r["crates"]) for r in batch.inbound],
+        )
+        conn.executemany(
+            "INSERT INTO transfers (upload_id, from_session, to_session, crates) VALUES (?, ?, ?, ?)",
+            [(upload_id, t["from_session"], t["to_session"], t["crates"]) for t in batch.transfers],
+        )
+        conn.executemany(
+            "INSERT INTO deliveries (upload_id, session, kind, destination, crates) VALUES (?, ?, ?, ?, ?)",
+            [(upload_id, d["session"], d["kind"], d["destination"], d["crates"]) for d in batch.deliveries],
+        )
+        conn.executemany(
+            "INSERT INTO sessions (name, orchard) VALUES (?, ?)",
+            [(s, o) for s, o in sorted(session_orchard.items()) if o is not None],
+        )
+    except sqlite3.IntegrityError as exc:
         if "UNIQUE" in str(exc) and "batch_hash" in str(exc):
             raise BatchRejected(["该批次已上传并入账，请勿重复提交"]) from exc
+        if "UNIQUE" in str(exc) and "sessions" in str(exc):
+            raise BatchRejected(["仓次名已被其他上传占用，请刷新页面后重新提交"]) from exc
         raise
 
 
@@ -297,7 +329,7 @@ def existing_destinations(conn):
 
 
 def orchard_summaries(conn):
-    """各果园汇总：总箱数、去向数、仓次数。"""
+    """各果园汇总：总箱数、去向数、仓次数、组数。"""
     rows = conn.execute(
         """
         SELECT s.orchard AS orchard,
@@ -310,22 +342,177 @@ def orchard_summaries(conn):
         ORDER BY s.orchard
         """
     ).fetchall()
-    return [dict(r) for r in rows]
+    group_counts = {
+        r["orchard"]: r["n"]
+        for r in conn.execute(
+            "SELECT orchard, COUNT(*) AS n FROM dest_groups GROUP BY orchard"
+        )
+    }
+    out = []
+    for r in rows:
+        item = dict(r)
+        item["groups"] = group_counts.get(item["orchard"], 0)
+        out.append(item)
+    return out
+
+
+def orchard_destinations(conn, orchard):
+    """某果园已入账的单据去向（去重）。"""
+    rows = conn.execute(
+        """
+        SELECT DISTINCT d.destination AS destination
+        FROM deliveries d JOIN sessions s ON d.session = s.name
+        WHERE s.orchard = ?
+        """,
+        (orchard,),
+    )
+    return {r["destination"] for r in rows}
+
+
+def group_names_by_orchard(conn):
+    """{orchard: {组名, ...}}，用于核对上传去向是否与组名冲突。"""
+    out = defaultdict(set)
+    for r in conn.execute("SELECT orchard, name FROM dest_groups"):
+        out[r["orchard"]].add(r["name"])
+    return dict(out)
+
+
+def list_groups(conn, orchard=None):
+    """建组结果，按果园 + 组名排序：[{id, orchard, name, destinations}]。"""
+    if orchard is None:
+        group_rows = conn.execute(
+            "SELECT id, orchard, name FROM dest_groups ORDER BY orchard, name"
+        ).fetchall()
+    else:
+        group_rows = conn.execute(
+            "SELECT id, orchard, name FROM dest_groups WHERE orchard = ? ORDER BY name",
+            (orchard,),
+        ).fetchall()
+    by_id = {r["id"]: {"id": r["id"], "orchard": r["orchard"], "name": r["name"], "destinations": []}
+             for r in group_rows}
+    if by_id:
+        placeholders = ",".join("?" for _ in by_id)
+        for m in conn.execute(
+            f"SELECT group_id, destination FROM dest_group_members"
+            f" WHERE group_id IN ({placeholders}) ORDER BY destination",
+            tuple(by_id),
+        ):
+            by_id[m["group_id"]]["destinations"].append(m["destination"])
+    return list(by_id.values())
+
+
+def destination_group_map(conn, orchard):
+    """{去向: 组名}，仅该果园。"""
+    rows = conn.execute(
+        """
+        SELECT m.destination AS destination, g.name AS name
+        FROM dest_group_members m JOIN dest_groups g ON g.id = m.group_id
+        WHERE m.orchard = ?
+        """,
+        (orchard,),
+    )
+    return {r["destination"]: r["name"] for r in rows}
+
+
+def create_group(conn, orchard, name, destinations):
+    """在调用方已开启的写事务内建组；不合法抛 GroupRejected（整笔不生效）。
+
+    规则：从该果园已入账去向里至少选 2 个；一个去向在同一果园最多入一组；
+    组名须与该果园的其他组名、单据去向都不同。冲突时 problems 里点名冲突名称。
+    """
+    name = (name or "").strip()
+    destinations = list(dict.fromkeys((d or "").strip() for d in destinations if (d or "").strip()))
+
+    problems = []
+    if not name:
+        problems.append("组名不能为空")
+    elif len(name) > MAX_NAME_LEN:
+        problems.append(f"组名超长（>{MAX_NAME_LEN} 字符）")
+    if len(destinations) < MIN_GROUP_DESTINATIONS:
+        problems.append(f"每个组至少要选 {MIN_GROUP_DESTINATIONS} 个去向")
+
+    available = orchard_destinations(conn, orchard)
+    unknown = [d for d in destinations if d not in available]
+    if unknown:
+        problems.append(
+            f"以下去向不属于果园 {orchard} 的已入账去向：{', '.join(unknown)}"
+        )
+
+    if name:
+        existing_names = {r["name"] for r in conn.execute(
+            "SELECT name FROM dest_groups WHERE orchard = ?", (orchard,)
+        )}
+        if name in existing_names:
+            problems.append(f"组名 “{name}” 与本果园已有组名冲突")
+        if name in available:
+            problems.append(f"组名 “{name}” 与本果园已有单据去向重名")
+
+    if destinations:
+        placeholders = ",".join("?" for _ in destinations)
+        existing = conn.execute(
+            f"""
+            SELECT m.destination AS destination, g.name AS group_name
+            FROM dest_group_members m JOIN dest_groups g ON g.id = m.group_id
+            WHERE m.orchard = ? AND m.destination IN ({placeholders})
+            ORDER BY m.destination
+            """,
+            (orchard, *destinations),
+        ).fetchall()
+        for r in existing:
+            problems.append(
+                f"去向 “{r['destination']}” 已在组 “{r['group_name']}” 中，同一果园内一个去向最多入一组"
+            )
+
+    if problems:
+        raise GroupRejected(problems)
+
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    try:
+        cur = conn.execute(
+            "INSERT INTO dest_groups (orchard, name, created_at) VALUES (?, ?, ?)",
+            (orchard, name, now),
+        )
+        group_id = cur.lastrowid
+        conn.executemany(
+            "INSERT INTO dest_group_members (group_id, orchard, destination) VALUES (?, ?, ?)",
+            [(group_id, orchard, d) for d in destinations],
+        )
+    except sqlite3.IntegrityError as exc:
+        raise GroupRejected([f"组名或去向与本果园现有分组冲突（{exc}），本次建组未生效"]) from exc
+    return group_id
+
+
+def dissolve_group(conn, orchard, group_id):
+    """在调用方已开启的写事务内撤组；组内单据自动恢复按原去向出数。"""
+    row = conn.execute(
+        "SELECT id FROM dest_groups WHERE id = ? AND orchard = ?", (group_id, orchard)
+    ).fetchone()
+    if row is None:
+        raise GroupRejected([f"果园 {orchard} 下不存在该组，可能已被撤销"])
+    conn.execute("DELETE FROM dest_group_members WHERE group_id = ?", (group_id,))
+    conn.execute("DELETE FROM dest_groups WHERE id = ?", (group_id,))
 
 
 def orchard_entries(conn, orchard):
-    """某果园按去向的箱数汇总 —— 核对包的全部内容，条目数只随去向数量变化。"""
+    """某果园按去向的箱数汇总 —— 核对包的全部内容。
+
+    已入组的去向按组名合成一项（组内全部新旧单据一起计入），未入组的按原名
+    单独列出；条目数只随“去向 / 组”数量变化，不含任何明细。
+    """
     rows = conn.execute(
         """
         SELECT d.destination AS destination, SUM(d.crates) AS crates
         FROM deliveries d JOIN sessions s ON d.session = s.name
         WHERE s.orchard = ?
         GROUP BY d.destination
-        ORDER BY d.destination
         """,
         (orchard,),
     ).fetchall()
-    return [{"destination": r["destination"], "crates": r["crates"]} for r in rows]
+    grouping = destination_group_map(conn, orchard)
+    merged = defaultdict(int)
+    for r in rows:
+        merged[grouping.get(r["destination"], r["destination"])] += r["crates"]
+    return [{"destination": d, "crates": merged[d]} for d in sorted(merged)]
 
 
 def overview(conn):

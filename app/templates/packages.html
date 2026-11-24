@@ -1,19 +1,100 @@
 {% extends "base.html" %}
 {% block content %}
 <h2>核对包</h2>
-<p>核对包只含果园各去向的箱数汇总（条目数只随去向数量变化），并带签名防篡改。</p>
+<p>核对包只含果园各去向的箱数汇总（条目数只随去向 / 组数量变化），并带签名防篡改。</p>
+
+<h3>分组代报</h3>
+<p>几个市场由同一个经销商代报箱数时，可在同一果园内把至少
+{{ min_group_destinations }} 个已入账去向建成一个组。组内箱数在核对包里合成一项，
+未入组的去向仍按原名出数。</p>
+<form method="get" action="{{ url_for('main.packages') }}" class="inline-form">
+  <label>选择果园
+    <select name="orchard" onchange="this.form.submit()">
+      <option value="">— 请选择 —</option>
+      {% for o in orchards %}
+      <option value="{{ o.orchard }}" {% if o.orchard == selected_orchard %}selected{% endif %}>{{ o.orchard }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <noscript><button type="submit">选择</button></noscript>
+</form>
+
+{% if selected_orchard %}
+  {% if available_destinations %}
+  <section class="card">
+    <h4>在果园 {{ selected_orchard }} 建组</h4>
+    <form method="post" action="{{ url_for('main.create_group') }}" class="group-form">
+      <input type="hidden" name="orchard" value="{{ selected_orchard }}">
+      <label>组名 <input type="text" name="name" maxlength="64" required
+        placeholder="例如 经销商甲"></label>
+      <fieldset>
+        <legend>选择去向（至少 {{ min_group_destinations }} 个）</legend>
+        {% for d in available_destinations %}
+        {% if d not in grouped_destinations %}
+        <label class="check">
+          <input type="checkbox" name="destination" value="{{ d }}">
+          {{ d }}
+        </label>
+        {% endif %}
+        {% endfor %}
+        {% for d, g in grouped_destinations|dictsort %}
+        <label class="check disabled">
+          <input type="checkbox" disabled>
+          {{ d }}（已在组 “{{ g }}” 中）
+        </label>
+        {% endfor %}
+      </fieldset>
+      <button type="submit">建组</button>
+    </form>
+    <p class="hint">组名须与本果园的其他组名、单据去向都不同；同一去向在同一果园最多入一组，
+    不同果园可分别入组。</p>
+  </section>
+  {% else %}
+  <p>该果园还没有已入账的去向，无法建组。</p>
+  {% endif %}
+
+  <section class="card">
+    <h4>果园 {{ selected_orchard }} 现有的组</h4>
+    {% if selected_groups %}
+    <table>
+      <tr><th>组名</th><th>组内去向</th><th></th></tr>
+      {% for g in selected_groups %}
+      <tr>
+        <td>{{ g.name }}</td>
+        <td>{{ g.destinations|join('、') }}</td>
+        <td>
+          <form method="post" action="{{ url_for('main.dissolve_group', group_id=g.id) }}" class="inline-form">
+            <input type="hidden" name="orchard" value="{{ selected_orchard }}">
+            <button type="submit" class="secondary">撤组</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% else %}
+    <p>该果园暂无分组，核对包按原去向分别出数。</p>
+    {% endif %}
+  </section>
+{% endif %}
+
+<h3>各果园汇总与核对包</h3>
 {% if orchards %}
   {% for o in orchards %}
   <section class="card">
-    <h3>{{ o.orchard }}</h3>
+    <h3>{{ o.orchard }}{% if o.groups %} · {{ o.groups }} 个组{% endif %}</h3>
     {% if o.entries %}
     <table>
-      <tr><th>去向</th><th>箱数</th></tr>
+      <tr><th>去向 / 组</th><th>箱数</th></tr>
       {% for e in o.entries %}
       <tr><td>{{ e.destination }}</td><td>{{ e.crates }}</td></tr>
       {% endfor %}
       <tr class="total"><td>合计</td><td>{{ o.total_crates }}</td></tr>
     </table>
+    {% if o.group_list %}
+    <p class="hint">组：
+      {% for g in o.group_list %}{{ g.name }}（{{ g.destinations|join('、') }}）{% if not loop.last %}；{% endif %}{% endfor %}
+    </p>
+    {% endif %}
     <p><a class="button" href="{{ url_for('main.download_package', orchard=o.orchard) }}">下载核对包（JSON）</a></p>
     {% else %}
     <p>该果园暂无交货/余箱记录，无法生成核对包。</p>

@@ -14,7 +14,7 @@ from flask import (
 )
 
 from . import checker, ledger
-from .db import get_db
+from .db import get_db, read_transaction, write_transaction
 
 bp = Blueprint("main", __name__)
 
@@ -22,11 +22,15 @@ bp = Blueprint("main", __name__)
 @bp.get("/")
 def index():
     conn = get_db()
+    with read_transaction(conn):
+        overview = ledger.overview(conn)
+        orchards = ledger.orchard_summaries(conn)
+        destinations = sorted(ledger.existing_destinations(conn))
     return render_template(
         "index.html",
-        overview=ledger.overview(conn),
-        orchards=ledger.orchard_summaries(conn),
-        destinations=sorted(ledger.existing_destinations(conn)),
+        overview=overview,
+        orchards=orchards,
+        destinations=destinations,
         max_destinations=ledger.MAX_DESTINATIONS,
     )
 
@@ -50,11 +54,17 @@ def upload():
             try:
                 batch = ledger.parse_batch(raw["inbound"], raw["transfers"], raw["deliveries"])
                 conn = get_db()
-                session_orchard = ledger.validate_batch(
-                    batch, ledger.existing_sessions(conn), ledger.existing_destinations(conn)
-                )
                 digest = ledger.batch_hash(raw["inbound"], raw["transfers"], raw["deliveries"])
-                ledger.persist_batch(conn, digest, batch, session_orchard)
+                # 校验 + 入账在同一写事务内：后提交的上传会看到先提交的建组结果，
+                # 重名冲突时整笔退回并点名冲突名称。
+                with write_transaction(conn):
+                    session_orchard = ledger.validate_batch(
+                        batch,
+                        ledger.existing_sessions(conn),
+                        ledger.existing_destinations(conn),
+                        ledger.group_names_by_orchard(conn),
+                    )
+                    ledger.persist_batch(conn, digest, batch, session_orchard)
             except ledger.BatchRejected as exc:
                 problems = exc.problems
             else:
@@ -83,16 +93,70 @@ def upload():
 @bp.get("/packages")
 def packages():
     conn = get_db()
-    summaries = ledger.orchard_summaries(conn)
-    for s in summaries:
-        s["entries"] = ledger.orchard_entries(conn, s["orchard"])
-    return render_template("packages.html", orchards=summaries)
+    selected = (request.args.get("orchard") or "").strip()
+    # 整页数据取自同一已提交快照（导入 / 建组 / 撤组可在读取期间继续提交）
+    with read_transaction(conn):
+        summaries = ledger.orchard_summaries(conn)
+        for s in summaries:
+            s["entries"] = ledger.orchard_entries(conn, s["orchard"])
+            # s["groups"] 是组数，组明细另放 group_list，避免互相覆盖
+            s["group_list"] = ledger.list_groups(conn, s["orchard"])
+        available = sorted(ledger.orchard_destinations(conn, selected)) if selected else []
+        selected_groups = ledger.list_groups(conn, selected) if selected else []
+        grouped_destinations = ledger.destination_group_map(conn, selected) if selected else {}
+    return render_template(
+        "packages.html",
+        orchards=summaries,
+        selected_orchard=selected,
+        available_destinations=available,
+        selected_groups=selected_groups,
+        grouped_destinations=grouped_destinations,
+        min_group_destinations=ledger.MIN_GROUP_DESTINATIONS,
+    )
+
+
+@bp.post("/groups")
+def create_group():
+    conn = get_db()
+    orchard = (request.form.get("orchard") or "").strip()
+    name = request.form.get("name") or ""
+    destinations = request.form.getlist("destination")
+    if not orchard:
+        flash("请先选择果园。", "error")
+        return redirect(url_for("main.packages"))
+    try:
+        with write_transaction(conn):
+            ledger.create_group(conn, orchard, name, destinations)
+    except ledger.GroupRejected as exc:
+        for p in exc.problems:
+            flash(p, "error")
+        flash("本次建组未生效，请修正后重新提交。", "error")
+        return redirect(url_for("main.packages", orchard=orchard))
+    flash(f"已在果园 {orchard} 建组 “{name.strip()}”。", "ok")
+    return redirect(url_for("main.packages", orchard=orchard))
+
+
+@bp.post("/groups/<int:group_id>/dissolve")
+def dissolve_group(group_id):
+    conn = get_db()
+    orchard = (request.form.get("orchard") or "").strip()
+    try:
+        with write_transaction(conn):
+            ledger.dissolve_group(conn, orchard, group_id)
+    except ledger.GroupRejected as exc:
+        for p in exc.problems:
+            flash(p, "error")
+        return redirect(url_for("main.packages", orchard=orchard))
+    flash(f"已撤销果园 {orchard} 的组；组内单据恢复按原去向分别出数。", "ok")
+    return redirect(url_for("main.packages", orchard=orchard))
 
 
 @bp.get("/packages/<path:orchard>/download")
 def download_package(orchard):
     conn = get_db()
-    entries = ledger.orchard_entries(conn, orchard)
+    # 读取事务固定快照：包内箱数与分组必然来自同一已提交状态
+    with read_transaction(conn):
+        entries = ledger.orchard_entries(conn, orchard)
     if not entries:
         flash(f"果园 {orchard} 没有任何去向汇总，无法生成核对包。", "error")
         return redirect(url_for("main.packages"))
